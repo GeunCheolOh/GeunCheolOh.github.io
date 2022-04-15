@@ -7,7 +7,7 @@ toc: true
 author_profile: false
 date: 2022-04-16 00:23:20 +0200
 ---
-논문을 읽고 ResNet 모델을 구현해보았습니다.
+
 <head>
   <style>
     table.dataframe {
