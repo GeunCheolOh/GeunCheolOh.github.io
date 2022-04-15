@@ -1,10 +1,11 @@
 ---
 layout: single
-title:  "ResNet34 & 50 구현"
-categories: 논문구현
-tag: [ResNet, blog, implementation]
+title:  "ResNet34 & 50 구현하기"
+categories: implementation
+tag: [ResNet, implementation]
 toc: true
 author_profile: false
+date: 2022-04-16 00:23:20 +0200
 ---
 
 <head>
@@ -79,11 +80,7 @@ author_profile: false
 </head>
 
 
----
-
 ## Dataset preparation
-
----
 
 
 
@@ -224,11 +221,7 @@ fig = tfds.show_examples(ds_test, ds_info)
 <pre>
 <Figure size 648x648 with 9 Axes>
 </pre>
----
-
 ## Model Build
-
-___
 
 
 ResNet의 핵심인 skip connection을 구현하기 위해 다음 함수`identity_block`를 선언한다.  
@@ -1243,11 +1236,7 @@ Trainable params: 24,092,290
 Non-trainable params: 53,120
 __________________________________________________________________________________________________
 </pre>
----
-
 ## Model Train
-
----
 
 
 ### Model checkpoint 설정
@@ -1552,11 +1541,11 @@ plt.show()
 <pre>
 <Figure size 432x288 with 1 Axes>
 </pre>
----
 
-Ablation study
 
----
+## Ablation study
+
+
 
 Plain34와 Plain50 을 구성한다.
 
@@ -2596,11 +2585,7 @@ Epoch 69/70
 Epoch 70/70
 617/617 [==============================] - 32s 52ms/step - loss: 0.6942 - accuracy: 0.4983 - val_loss: 0.7123 - val_accuracy: 0.4772
 </pre>
----
-
 ## Conclusion
-
----
 
 
 
@@ -2659,11 +2644,9 @@ plt.show()
 <pre>
 <Figure size 432x288 with 1 Axes>
 </pre>
----
-
 ## Discussion
 
----
+
 
 - ResNet34가 ResNet50보다 빠른 속도로 학습이 되는 것을 확인할 수 있다. 
 
