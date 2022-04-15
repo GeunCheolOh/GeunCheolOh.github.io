@@ -1,0 +1,2675 @@
+---
+layout: single
+title:  "ResNet34 & 50 구현"
+categories: 논문구현
+tag: [ResNet, blog, implementation]
+toc: true
+author_profile: false
+---
+
+<head>
+  <style>
+    table.dataframe {
+      white-space: normal;
+      width: 100%;
+      height: 240px;
+      display: block;
+      overflow: auto;
+      font-family: Arial, sans-serif;
+      font-size: 0.9rem;
+      line-height: 20px;
+      text-align: center;
+      border: 0px !important;
+    }
+
+    table.dataframe th {
+      text-align: center;
+      font-weight: bold;
+      padding: 8px;
+    }
+
+    table.dataframe td {
+      text-align: center;
+      padding: 8px;
+    }
+
+    table.dataframe tr:hover {
+      background: #b8d1f3; 
+    }
+
+    .output_prompt {
+      overflow: auto;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      border-radius: 0.3rem;
+      -webkit-overflow-scrolling: touch;
+      padding: 0.8rem;
+      margin-top: 0;
+      margin-bottom: 15px;
+      font: 1rem Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      color: $code-text-color;
+      border: solid 1px $border-color;
+      border-radius: 0.3rem;
+      word-break: normal;
+      white-space: pre;
+    }
+
+  .dataframe tbody tr th:only-of-type {
+      vertical-align: middle;
+  }
+
+  .dataframe tbody tr th {
+      vertical-align: top;
+  }
+
+  .dataframe thead th {
+      text-align: center !important;
+      padding: 8px;
+  }
+
+  .page__content p {
+      margin: 0 0 0px !important;
+  }
+
+  .page__content p > strong {
+    font-size: 0.8rem !important;
+  }
+
+  </style>
+</head>
+
+
+---
+
+## Dataset preparation
+
+---
+
+
+
+```python
+# Libraries & packages
+import numpy as np
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+import tensorflow_datasets as tfds
+from tensorflow import keras
+from keras.models import Sequential, Model,load_model
+from keras.layers import Input, Add, Dense, Activation, ZeroPadding2D, BatchNormalization, Flatten, Conv2D, AveragePooling2D, MaxPooling2D, GlobalMaxPooling2D,MaxPool2D
+from keras.initializers import he_normal
+from keras.callbacks import ModelCheckpoint, EarlyStopping
+
+#from keras.optimizers import SGD
+
+print(tf.__version__)
+print(np.__version__)
+```
+
+<pre>
+2.8.0
+1.21.5
+</pre>
+### Train/test split
+
+`cats_vs_dogs` dataset에는 training data만 존재하므로 train:test를 85:15 비율로 분할한다.
+
+
+
+```python
+# Dataset load
+import urllib3
+urllib3.disable_warnings()
+
+#tfds.disable_progress_bar()   # 이 주석을 풀면 데이터셋 다운로드과정의 프로그레스바가 나타나지 않습니다.
+
+(ds_train, ds_test), ds_info = tfds.load(
+    'cats_vs_dogs',
+    split=['train[:85%]', 'train[85%:]'],
+    shuffle_files=True,
+    with_info=True,
+    as_supervised=True
+)
+```
+
+
+```python
+print(ds_info.features)
+```
+
+<pre>
+FeaturesDict({
+    'image': Image(shape=(None, None, 3), dtype=tf.uint8),
+    'image/filename': Text(shape=(), dtype=tf.string),
+    'label': ClassLabel(shape=(), dtype=tf.int64, num_classes=2),
+})
+</pre>
+- `tf.data.experimental`: Experimental API for building input pipelines
+
+
+
+- `cardinality`: Dataset의 shaper와 dtype 반환(cardinality=집합의 크기)
+
+
+
+```python
+print(tf.data.experimental.cardinality(ds_train))
+print(tf.data.experimental.cardinality(ds_test))
+```
+
+<pre>
+tf.Tensor(19773, shape=(), dtype=int64)
+tf.Tensor(3489, shape=(), dtype=int64)
+</pre>
+### Scale normalization
+
+
+
+```python
+# Input normalization
+def normalize_and_resize_img(image, label):
+    """Normalizes images: 'uint8' -> 'float32'."""
+    image = tf.image.resize(image, [32, 32])
+    return tf.cast(image, tf.float32) / 255., label
+```
+
+
+```python
+def apply_normalize_on_dataset(ds, is_test=False, batch_size=16):
+    ds = ds.map(
+        normalize_and_resize_img,
+        num_parallel_calls=1
+    )
+    ds = ds.batch(batch_size)
+    """64 or 128 recommended"""
+    if not is_test:
+        ds = ds.repeat()
+        ds = ds.shuffle(200)
+    ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
+    return ds    
+```
+
+
+```python
+ds_info.features["label"].num_classes
+```
+
+<pre>
+2
+</pre>
+
+```python
+ds_info.features["label"].names
+```
+
+<pre>
+['cat', 'dog']
+</pre>
+### Image preview
+
+
+
+```python
+fig = tfds.show_examples(ds_train, ds_info)
+```
+
+<pre>
+<Figure size 648x648 with 9 Axes>
+</pre>
+
+```python
+fig = tfds.show_examples(ds_test, ds_info)
+```
+
+<pre>
+<Figure size 648x648 with 9 Axes>
+</pre>
+---
+
+## Model Build
+
+___
+
+
+ResNet의 핵심인 skip connection을 구현하기 위해 다음 함수`identity_block`를 선언한다.  
+
+![image.png](data:image/png;base64,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)
+
+
+### Identity & Convolutional block
+
+
+`identity_block`과 더불어 skip connection 구조로 형성된 `convolutional_block(bottleneck)`을 구현한다.  
+
+위 블록과의 차이는 residual x를 그대로 이용하지 않고, 1×1 conv 필터를 통해 가공한 후 F(x)에 더한다는 점이다.
+
+
+
+```python
+### ResNet 34 구성단위
+def identity_block(X, f, filters, stage, block):
+   
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+    F1, F2, F3 = filters
+
+    X_shortcut = X
+   
+    X = Conv2D(filters=F1, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+
+    X = Add()([X, X_shortcut])# SKIP Connection
+    X = Activation('relu')(X)
+
+    return X
+
+
+def convolutional_block(X, f, filters, stage, block, s=2):
+   
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    F1, F2, F3 = filters
+
+    X_shortcut = X
+
+    X = Conv2D(filters=F1, kernel_size=(f, f), strides=(s, s), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+
+    X_shortcut = Conv2D(filters=F2, kernel_size=(1, 1), strides=(s, s), kernel_initializer='he_normal', name=conv_name_base + '1')(X_shortcut)
+    X_shortcut = BatchNormalization(axis=3, name=bn_name_base + '1')(X_shortcut)
+
+    X = Add()([X, X_shortcut])
+    X = Activation('relu')(X)
+
+    return X
+```
+
+ResNet50 의 경우, identity block과 convolutional block에 Layer 3까지 존재하므로 이를 `identity_block50`과 `convolutional_block50`에 새로 선언해야한다.
+
+
+
+```python
+### ResNet 50 구성단위
+def identity_block50(X, f, filters, stage, block):
+   
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+    F1, F2, F3 = filters
+
+    X_shortcut = X
+   
+    X = Conv2D(filters=F1, kernel_size=(1, 1), strides=(1, 1), kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), kernel_initializer='he_normal', padding='same', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F3, kernel_size=(1, 1), strides=(1, 1), kernel_initializer='he_normal', name=conv_name_base + '2c')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2c')(X)
+
+    X = Add()([X, X_shortcut])# SKIP Connection
+    X = Activation('relu')(X)
+
+    return X
+
+
+def convolutional_block50(X, f, filters, stage, block, s=2):
+   
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    F1, F2, F3 = filters
+
+    X_shortcut = X
+
+    X = Conv2D(filters=F1, kernel_size=(1, 1), strides=(s, s), kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F3, kernel_size=(1, 1), strides=(1, 1), kernel_initializer='he_normal', name=conv_name_base + '2c')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2c')(X)
+
+    X_shortcut = Conv2D(filters=F3, kernel_size=(1, 1), strides=(s, s), kernel_initializer='he_normal', name=conv_name_base + '1')(X_shortcut)
+    X_shortcut = BatchNormalization(axis=3, name=bn_name_base + '1')(X_shortcut)
+
+    X = Add()([X, X_shortcut])
+    X = Activation('relu')(X)
+
+    return X
+```
+
+### ResNet builder
+
+
+
+```python
+def ResNet(input_shape=(32, 32, 3), is_50=False):
+
+    X_input = Input(input_shape)
+
+    X = ZeroPadding2D((3, 3))(X_input)
+
+    X = Conv2D(64, (7, 7), strides=(2, 2), kernel_initializer='he_normal', name='conv1')(X)
+    X = BatchNormalization(axis=3, name='bn_conv1')(X)
+    X = Activation('relu')(X)
+    X = MaxPooling2D((3, 3), strides=(2, 2))(X)
+
+
+    if is_50 == False: #ResNet34를 구현
+        pass 
+        X = convolutional_block(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
+        X = identity_block(X, 3, [64, 64, 256], stage=2, block='b')
+        X = identity_block(X, 3, [64, 64, 256], stage=2, block='c')
+
+
+        X = convolutional_block(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
+        X = identity_block(X, 3, [128, 128, 512], stage=3, block='b')
+        X = identity_block(X, 3, [128, 128, 512], stage=3, block='c')
+        X = identity_block(X, 3, [128, 128, 512], stage=3, block='d')
+
+        X = convolutional_block(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
+        X = identity_block(X, 3, [256, 256, 1024], stage=4, block='b')
+        X = identity_block(X, 3, [256, 256, 1024], stage=4, block='c')
+        X = identity_block(X, 3, [256, 256, 1024], stage=4, block='d')
+        X = identity_block(X, 3, [256, 256, 1024], stage=4, block='e')
+        X = identity_block(X, 3, [256, 256, 1024], stage=4, block='f')
+
+        X = X = convolutional_block(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
+        X = identity_block(X, 3, [512, 512, 2048], stage=5, block='b')
+        X = identity_block(X, 3, [512, 512, 2048], stage=5, block='c')
+
+        X = AveragePooling2D(pool_size=(2, 2), padding='same')(X)
+        
+        model = Model(inputs=X_input, outputs=X, name='ResNet34')
+
+        return model
+
+
+    else:
+        X = convolutional_block50(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
+        X = identity_block50(X, 3, [64, 64, 256], stage=2, block='b')
+        X = identity_block50(X, 3, [64, 64, 256], stage=2, block='c')
+
+
+        X = convolutional_block50(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
+        X = identity_block50(X, 3, [128, 128, 512], stage=3, block='b')
+        X = identity_block50(X, 3, [128, 128, 512], stage=3, block='c')
+        X = identity_block50(X, 3, [128, 128, 512], stage=3, block='d')
+
+        X = convolutional_block50(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
+        X = identity_block50(X, 3, [256, 256, 1024], stage=4, block='b')
+        X = identity_block50(X, 3, [256, 256, 1024], stage=4, block='c')
+        X = identity_block50(X, 3, [256, 256, 1024], stage=4, block='d')
+        X = identity_block50(X, 3, [256, 256, 1024], stage=4, block='e')
+        X = identity_block50(X, 3, [256, 256, 1024], stage=4, block='f')
+
+        X = X = convolutional_block50(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
+        X = identity_block50(X, 3, [512, 512, 2048], stage=5, block='b')
+        X = identity_block50(X, 3, [512, 512, 2048], stage=5, block='c')
+
+        X = AveragePooling2D(pool_size=(2, 2), padding='same')(X)
+        
+        model = Model(inputs=X_input, outputs=X, name='ResNet50')
+
+        return model
+```
+
+### ResNet34 summary
+
+
+
+```python
+resnet34 = ResNet(input_shape=(32, 32, 3), is_50=False)
+```
+
+
+```python
+headModel = resnet34.output
+headModel = Flatten()(headModel)
+headModel=Dense(256, activation='relu', name='fc1',kernel_initializer='he_normal')(headModel)
+headModel=Dense(128, activation='relu', name='fc2',kernel_initializer='he_normal')(headModel)
+headModel = Dense( 2,activation='sigmoid', name='fc3',kernel_initializer='he_normal')(headModel)
+
+resnet34 = Model(inputs=resnet34.input, outputs=headModel)
+```
+
+
+```python
+resnet34.summary()
+```
+
+<pre>
+Model: "model_4"
+__________________________________________________________________________________________________
+ Layer (type)                   Output Shape         Param #     Connected to                     
+==================================================================================================
+ input_5 (InputLayer)           [(None, 32, 32, 3)]  0           []                               
+                                                                                                  
+ zero_padding2d_4 (ZeroPadding2  (None, 38, 38, 3)   0           ['input_5[0][0]']                
+ D)                                                                                               
+                                                                                                  
+ conv1 (Conv2D)                 (None, 16, 16, 64)   9472        ['zero_padding2d_4[0][0]']       
+                                                                                                  
+ bn_conv1 (BatchNormalization)  (None, 16, 16, 64)   256         ['conv1[0][0]']                  
+                                                                                                  
+ activation_164 (Activation)    (None, 16, 16, 64)   0           ['bn_conv1[0][0]']               
+                                                                                                  
+ max_pooling2d_4 (MaxPooling2D)  (None, 7, 7, 64)    0           ['activation_164[0][0]']         
+                                                                                                  
+ res2a_branch2a (Conv2D)        (None, 7, 7, 64)     36928       ['max_pooling2d_4[0][0]']        
+                                                                                                  
+ bn2a_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_165 (Activation)    (None, 7, 7, 64)     0           ['bn2a_branch2a[0][0]']          
+                                                                                                  
+ res2a_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_165[0][0]']         
+                                                                                                  
+ res2a_branch1 (Conv2D)         (None, 7, 7, 64)     4160        ['max_pooling2d_4[0][0]']        
+                                                                                                  
+ bn2a_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn2a_branch1 (BatchNormalizati  (None, 7, 7, 64)    256         ['res2a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_32 (Add)                   (None, 7, 7, 64)     0           ['bn2a_branch2b[0][0]',          
+                                                                  'bn2a_branch1[0][0]']           
+                                                                                                  
+ activation_166 (Activation)    (None, 7, 7, 64)     0           ['add_32[0][0]']                 
+                                                                                                  
+ res2b_branch2a (Conv2D)        (None, 7, 7, 64)     36928       ['activation_166[0][0]']         
+                                                                                                  
+ bn2b_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_167 (Activation)    (None, 7, 7, 64)     0           ['bn2b_branch2a[0][0]']          
+                                                                                                  
+ res2b_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_167[0][0]']         
+                                                                                                  
+ bn2b_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_33 (Add)                   (None, 7, 7, 64)     0           ['bn2b_branch2b[0][0]',          
+                                                                  'activation_166[0][0]']         
+                                                                                                  
+ activation_168 (Activation)    (None, 7, 7, 64)     0           ['add_33[0][0]']                 
+                                                                                                  
+ res2c_branch2a (Conv2D)        (None, 7, 7, 64)     36928       ['activation_168[0][0]']         
+                                                                                                  
+ bn2c_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_169 (Activation)    (None, 7, 7, 64)     0           ['bn2c_branch2a[0][0]']          
+                                                                                                  
+ res2c_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_169[0][0]']         
+                                                                                                  
+ bn2c_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_34 (Add)                   (None, 7, 7, 64)     0           ['bn2c_branch2b[0][0]',          
+                                                                  'activation_168[0][0]']         
+                                                                                                  
+ activation_170 (Activation)    (None, 7, 7, 64)     0           ['add_34[0][0]']                 
+                                                                                                  
+ res3a_branch2a (Conv2D)        (None, 4, 4, 128)    73856       ['activation_170[0][0]']         
+                                                                                                  
+ bn3a_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_171 (Activation)    (None, 4, 4, 128)    0           ['bn3a_branch2a[0][0]']          
+                                                                                                  
+ res3a_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_171[0][0]']         
+                                                                                                  
+ res3a_branch1 (Conv2D)         (None, 4, 4, 128)    8320        ['activation_170[0][0]']         
+                                                                                                  
+ bn3a_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn3a_branch1 (BatchNormalizati  (None, 4, 4, 128)   512         ['res3a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_35 (Add)                   (None, 4, 4, 128)    0           ['bn3a_branch2b[0][0]',          
+                                                                  'bn3a_branch1[0][0]']           
+                                                                                                  
+ activation_172 (Activation)    (None, 4, 4, 128)    0           ['add_35[0][0]']                 
+                                                                                                  
+ res3b_branch2a (Conv2D)        (None, 4, 4, 128)    147584      ['activation_172[0][0]']         
+                                                                                                  
+ bn3b_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_173 (Activation)    (None, 4, 4, 128)    0           ['bn3b_branch2a[0][0]']          
+                                                                                                  
+ res3b_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_173[0][0]']         
+                                                                                                  
+ bn3b_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_36 (Add)                   (None, 4, 4, 128)    0           ['bn3b_branch2b[0][0]',          
+                                                                  'activation_172[0][0]']         
+                                                                                                  
+ activation_174 (Activation)    (None, 4, 4, 128)    0           ['add_36[0][0]']                 
+                                                                                                  
+ res3c_branch2a (Conv2D)        (None, 4, 4, 128)    147584      ['activation_174[0][0]']         
+                                                                                                  
+ bn3c_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_175 (Activation)    (None, 4, 4, 128)    0           ['bn3c_branch2a[0][0]']          
+                                                                                                  
+ res3c_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_175[0][0]']         
+                                                                                                  
+ bn3c_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_37 (Add)                   (None, 4, 4, 128)    0           ['bn3c_branch2b[0][0]',          
+                                                                  'activation_174[0][0]']         
+                                                                                                  
+ activation_176 (Activation)    (None, 4, 4, 128)    0           ['add_37[0][0]']                 
+                                                                                                  
+ res3d_branch2a (Conv2D)        (None, 4, 4, 128)    147584      ['activation_176[0][0]']         
+                                                                                                  
+ bn3d_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3d_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_177 (Activation)    (None, 4, 4, 128)    0           ['bn3d_branch2a[0][0]']          
+                                                                                                  
+ res3d_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_177[0][0]']         
+                                                                                                  
+ bn3d_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3d_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_38 (Add)                   (None, 4, 4, 128)    0           ['bn3d_branch2b[0][0]',          
+                                                                  'activation_176[0][0]']         
+                                                                                                  
+ activation_178 (Activation)    (None, 4, 4, 128)    0           ['add_38[0][0]']                 
+                                                                                                  
+ res4a_branch2a (Conv2D)        (None, 2, 2, 256)    295168      ['activation_178[0][0]']         
+                                                                                                  
+ bn4a_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_179 (Activation)    (None, 2, 2, 256)    0           ['bn4a_branch2a[0][0]']          
+                                                                                                  
+ res4a_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_179[0][0]']         
+                                                                                                  
+ res4a_branch1 (Conv2D)         (None, 2, 2, 256)    33024       ['activation_178[0][0]']         
+                                                                                                  
+ bn4a_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn4a_branch1 (BatchNormalizati  (None, 2, 2, 256)   1024        ['res4a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_39 (Add)                   (None, 2, 2, 256)    0           ['bn4a_branch2b[0][0]',          
+                                                                  'bn4a_branch1[0][0]']           
+                                                                                                  
+ activation_180 (Activation)    (None, 2, 2, 256)    0           ['add_39[0][0]']                 
+                                                                                                  
+ res4b_branch2a (Conv2D)        (None, 2, 2, 256)    590080      ['activation_180[0][0]']         
+                                                                                                  
+ bn4b_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_181 (Activation)    (None, 2, 2, 256)    0           ['bn4b_branch2a[0][0]']          
+                                                                                                  
+ res4b_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_181[0][0]']         
+                                                                                                  
+ bn4b_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_40 (Add)                   (None, 2, 2, 256)    0           ['bn4b_branch2b[0][0]',          
+                                                                  'activation_180[0][0]']         
+                                                                                                  
+ activation_182 (Activation)    (None, 2, 2, 256)    0           ['add_40[0][0]']                 
+                                                                                                  
+ res4c_branch2a (Conv2D)        (None, 2, 2, 256)    590080      ['activation_182[0][0]']         
+                                                                                                  
+ bn4c_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_183 (Activation)    (None, 2, 2, 256)    0           ['bn4c_branch2a[0][0]']          
+                                                                                                  
+ res4c_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_183[0][0]']         
+                                                                                                  
+ bn4c_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_41 (Add)                   (None, 2, 2, 256)    0           ['bn4c_branch2b[0][0]',          
+                                                                  'activation_182[0][0]']         
+                                                                                                  
+ activation_184 (Activation)    (None, 2, 2, 256)    0           ['add_41[0][0]']                 
+                                                                                                  
+ res4d_branch2a (Conv2D)        (None, 2, 2, 256)    590080      ['activation_184[0][0]']         
+                                                                                                  
+ bn4d_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4d_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_185 (Activation)    (None, 2, 2, 256)    0           ['bn4d_branch2a[0][0]']          
+                                                                                                  
+ res4d_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_185[0][0]']         
+                                                                                                  
+ bn4d_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4d_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_42 (Add)                   (None, 2, 2, 256)    0           ['bn4d_branch2b[0][0]',          
+                                                                  'activation_184[0][0]']         
+                                                                                                  
+ activation_186 (Activation)    (None, 2, 2, 256)    0           ['add_42[0][0]']                 
+                                                                                                  
+ res4e_branch2a (Conv2D)        (None, 2, 2, 256)    590080      ['activation_186[0][0]']         
+                                                                                                  
+ bn4e_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4e_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_187 (Activation)    (None, 2, 2, 256)    0           ['bn4e_branch2a[0][0]']          
+                                                                                                  
+ res4e_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_187[0][0]']         
+                                                                                                  
+ bn4e_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4e_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_43 (Add)                   (None, 2, 2, 256)    0           ['bn4e_branch2b[0][0]',          
+                                                                  'activation_186[0][0]']         
+                                                                                                  
+ activation_188 (Activation)    (None, 2, 2, 256)    0           ['add_43[0][0]']                 
+                                                                                                  
+ res4f_branch2a (Conv2D)        (None, 2, 2, 256)    590080      ['activation_188[0][0]']         
+                                                                                                  
+ bn4f_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4f_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_189 (Activation)    (None, 2, 2, 256)    0           ['bn4f_branch2a[0][0]']          
+                                                                                                  
+ res4f_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_189[0][0]']         
+                                                                                                  
+ bn4f_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4f_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_44 (Add)                   (None, 2, 2, 256)    0           ['bn4f_branch2b[0][0]',          
+                                                                  'activation_188[0][0]']         
+                                                                                                  
+ activation_190 (Activation)    (None, 2, 2, 256)    0           ['add_44[0][0]']                 
+                                                                                                  
+ res5a_branch2a (Conv2D)        (None, 1, 1, 512)    1180160     ['activation_190[0][0]']         
+                                                                                                  
+ bn5a_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_191 (Activation)    (None, 1, 1, 512)    0           ['bn5a_branch2a[0][0]']          
+                                                                                                  
+ res5a_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_191[0][0]']         
+                                                                                                  
+ res5a_branch1 (Conv2D)         (None, 1, 1, 512)    131584      ['activation_190[0][0]']         
+                                                                                                  
+ bn5a_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn5a_branch1 (BatchNormalizati  (None, 1, 1, 512)   2048        ['res5a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_45 (Add)                   (None, 1, 1, 512)    0           ['bn5a_branch2b[0][0]',          
+                                                                  'bn5a_branch1[0][0]']           
+                                                                                                  
+ activation_192 (Activation)    (None, 1, 1, 512)    0           ['add_45[0][0]']                 
+                                                                                                  
+ res5b_branch2a (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_192[0][0]']         
+                                                                                                  
+ bn5b_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_193 (Activation)    (None, 1, 1, 512)    0           ['bn5b_branch2a[0][0]']          
+                                                                                                  
+ res5b_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_193[0][0]']         
+                                                                                                  
+ bn5b_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_46 (Add)                   (None, 1, 1, 512)    0           ['bn5b_branch2b[0][0]',          
+                                                                  'activation_192[0][0]']         
+                                                                                                  
+ activation_194 (Activation)    (None, 1, 1, 512)    0           ['add_46[0][0]']                 
+                                                                                                  
+ res5c_branch2a (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_194[0][0]']         
+                                                                                                  
+ bn5c_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_195 (Activation)    (None, 1, 1, 512)    0           ['bn5c_branch2a[0][0]']          
+                                                                                                  
+ res5c_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_195[0][0]']         
+                                                                                                  
+ bn5c_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_47 (Add)                   (None, 1, 1, 512)    0           ['bn5c_branch2b[0][0]',          
+                                                                  'activation_194[0][0]']         
+                                                                                                  
+ activation_196 (Activation)    (None, 1, 1, 512)    0           ['add_47[0][0]']                 
+                                                                                                  
+ average_pooling2d_4 (AveragePo  (None, 1, 1, 512)   0           ['activation_196[0][0]']         
+ oling2D)                                                                                         
+                                                                                                  
+ flatten_4 (Flatten)            (None, 512)          0           ['average_pooling2d_4[0][0]']    
+                                                                                                  
+ fc1 (Dense)                    (None, 256)          131328      ['flatten_4[0][0]']              
+                                                                                                  
+ fc2 (Dense)                    (None, 128)          32896       ['fc1[0][0]']                    
+                                                                                                  
+ fc3 (Dense)                    (None, 2)            258         ['fc2[0][0]']                    
+                                                                                                  
+==================================================================================================
+Total params: 21,479,106
+Trainable params: 21,461,954
+Non-trainable params: 17,152
+__________________________________________________________________________________________________
+</pre>
+### ResNet50 summary
+
+
+
+```python
+resnet50 = ResNet(input_shape=(32, 32, 3), is_50=True)
+```
+
+
+```python
+headModel = resnet50.output
+headModel = Flatten()(headModel)
+headModel=Dense(256, activation='relu', name='fc1',kernel_initializer='he_normal')(headModel)
+headModel=Dense(128, activation='relu', name='fc2',kernel_initializer='he_normal')(headModel)
+headModel = Dense( 2,activation='sigmoid', name='fc3', kernel_initializer='he_normal')(headModel)
+
+resnet50 = Model(inputs=resnet50.input, outputs=headModel)
+```
+
+
+```python
+resnet50.summary()
+```
+
+<pre>
+Model: "model_5"
+__________________________________________________________________________________________________
+ Layer (type)                   Output Shape         Param #     Connected to                     
+==================================================================================================
+ input_6 (InputLayer)           [(None, 32, 32, 3)]  0           []                               
+                                                                                                  
+ zero_padding2d_5 (ZeroPadding2  (None, 38, 38, 3)   0           ['input_6[0][0]']                
+ D)                                                                                               
+                                                                                                  
+ conv1 (Conv2D)                 (None, 16, 16, 64)   9472        ['zero_padding2d_5[0][0]']       
+                                                                                                  
+ bn_conv1 (BatchNormalization)  (None, 16, 16, 64)   256         ['conv1[0][0]']                  
+                                                                                                  
+ activation_197 (Activation)    (None, 16, 16, 64)   0           ['bn_conv1[0][0]']               
+                                                                                                  
+ max_pooling2d_5 (MaxPooling2D)  (None, 7, 7, 64)    0           ['activation_197[0][0]']         
+                                                                                                  
+ res2a_branch2a (Conv2D)        (None, 7, 7, 64)     4160        ['max_pooling2d_5[0][0]']        
+                                                                                                  
+ bn2a_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_198 (Activation)    (None, 7, 7, 64)     0           ['bn2a_branch2a[0][0]']          
+                                                                                                  
+ res2a_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_198[0][0]']         
+                                                                                                  
+ bn2a_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_199 (Activation)    (None, 7, 7, 64)     0           ['bn2a_branch2b[0][0]']          
+                                                                                                  
+ res2a_branch2c (Conv2D)        (None, 7, 7, 256)    16640       ['activation_199[0][0]']         
+                                                                                                  
+ res2a_branch1 (Conv2D)         (None, 7, 7, 256)    16640       ['max_pooling2d_5[0][0]']        
+                                                                                                  
+ bn2a_branch2c (BatchNormalizat  (None, 7, 7, 256)   1024        ['res2a_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn2a_branch1 (BatchNormalizati  (None, 7, 7, 256)   1024        ['res2a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_48 (Add)                   (None, 7, 7, 256)    0           ['bn2a_branch2c[0][0]',          
+                                                                  'bn2a_branch1[0][0]']           
+                                                                                                  
+ activation_200 (Activation)    (None, 7, 7, 256)    0           ['add_48[0][0]']                 
+                                                                                                  
+ res2b_branch2a (Conv2D)        (None, 7, 7, 64)     16448       ['activation_200[0][0]']         
+                                                                                                  
+ bn2b_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_201 (Activation)    (None, 7, 7, 64)     0           ['bn2b_branch2a[0][0]']          
+                                                                                                  
+ res2b_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_201[0][0]']         
+                                                                                                  
+ bn2b_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_202 (Activation)    (None, 7, 7, 64)     0           ['bn2b_branch2b[0][0]']          
+                                                                                                  
+ res2b_branch2c (Conv2D)        (None, 7, 7, 256)    16640       ['activation_202[0][0]']         
+                                                                                                  
+ bn2b_branch2c (BatchNormalizat  (None, 7, 7, 256)   1024        ['res2b_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_49 (Add)                   (None, 7, 7, 256)    0           ['bn2b_branch2c[0][0]',          
+                                                                  'activation_200[0][0]']         
+                                                                                                  
+ activation_203 (Activation)    (None, 7, 7, 256)    0           ['add_49[0][0]']                 
+                                                                                                  
+ res2c_branch2a (Conv2D)        (None, 7, 7, 64)     16448       ['activation_203[0][0]']         
+                                                                                                  
+ bn2c_branch2a (BatchNormalizat  (None, 7, 7, 64)    256         ['res2c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_204 (Activation)    (None, 7, 7, 64)     0           ['bn2c_branch2a[0][0]']          
+                                                                                                  
+ res2c_branch2b (Conv2D)        (None, 7, 7, 64)     36928       ['activation_204[0][0]']         
+                                                                                                  
+ bn2c_branch2b (BatchNormalizat  (None, 7, 7, 64)    256         ['res2c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_205 (Activation)    (None, 7, 7, 64)     0           ['bn2c_branch2b[0][0]']          
+                                                                                                  
+ res2c_branch2c (Conv2D)        (None, 7, 7, 256)    16640       ['activation_205[0][0]']         
+                                                                                                  
+ bn2c_branch2c (BatchNormalizat  (None, 7, 7, 256)   1024        ['res2c_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_50 (Add)                   (None, 7, 7, 256)    0           ['bn2c_branch2c[0][0]',          
+                                                                  'activation_203[0][0]']         
+                                                                                                  
+ activation_206 (Activation)    (None, 7, 7, 256)    0           ['add_50[0][0]']                 
+                                                                                                  
+ res3a_branch2a (Conv2D)        (None, 4, 4, 128)    32896       ['activation_206[0][0]']         
+                                                                                                  
+ bn3a_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_207 (Activation)    (None, 4, 4, 128)    0           ['bn3a_branch2a[0][0]']          
+                                                                                                  
+ res3a_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_207[0][0]']         
+                                                                                                  
+ bn3a_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_208 (Activation)    (None, 4, 4, 128)    0           ['bn3a_branch2b[0][0]']          
+                                                                                                  
+ res3a_branch2c (Conv2D)        (None, 4, 4, 512)    66048       ['activation_208[0][0]']         
+                                                                                                  
+ res3a_branch1 (Conv2D)         (None, 4, 4, 512)    131584      ['activation_206[0][0]']         
+                                                                                                  
+ bn3a_branch2c (BatchNormalizat  (None, 4, 4, 512)   2048        ['res3a_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn3a_branch1 (BatchNormalizati  (None, 4, 4, 512)   2048        ['res3a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_51 (Add)                   (None, 4, 4, 512)    0           ['bn3a_branch2c[0][0]',          
+                                                                  'bn3a_branch1[0][0]']           
+                                                                                                  
+ activation_209 (Activation)    (None, 4, 4, 512)    0           ['add_51[0][0]']                 
+                                                                                                  
+ res3b_branch2a (Conv2D)        (None, 4, 4, 128)    65664       ['activation_209[0][0]']         
+                                                                                                  
+ bn3b_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_210 (Activation)    (None, 4, 4, 128)    0           ['bn3b_branch2a[0][0]']          
+                                                                                                  
+ res3b_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_210[0][0]']         
+                                                                                                  
+ bn3b_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_211 (Activation)    (None, 4, 4, 128)    0           ['bn3b_branch2b[0][0]']          
+                                                                                                  
+ res3b_branch2c (Conv2D)        (None, 4, 4, 512)    66048       ['activation_211[0][0]']         
+                                                                                                  
+ bn3b_branch2c (BatchNormalizat  (None, 4, 4, 512)   2048        ['res3b_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_52 (Add)                   (None, 4, 4, 512)    0           ['bn3b_branch2c[0][0]',          
+                                                                  'activation_209[0][0]']         
+                                                                                                  
+ activation_212 (Activation)    (None, 4, 4, 512)    0           ['add_52[0][0]']                 
+                                                                                                  
+ res3c_branch2a (Conv2D)        (None, 4, 4, 128)    65664       ['activation_212[0][0]']         
+                                                                                                  
+ bn3c_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_213 (Activation)    (None, 4, 4, 128)    0           ['bn3c_branch2a[0][0]']          
+                                                                                                  
+ res3c_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_213[0][0]']         
+                                                                                                  
+ bn3c_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_214 (Activation)    (None, 4, 4, 128)    0           ['bn3c_branch2b[0][0]']          
+                                                                                                  
+ res3c_branch2c (Conv2D)        (None, 4, 4, 512)    66048       ['activation_214[0][0]']         
+                                                                                                  
+ bn3c_branch2c (BatchNormalizat  (None, 4, 4, 512)   2048        ['res3c_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_53 (Add)                   (None, 4, 4, 512)    0           ['bn3c_branch2c[0][0]',          
+                                                                  'activation_212[0][0]']         
+                                                                                                  
+ activation_215 (Activation)    (None, 4, 4, 512)    0           ['add_53[0][0]']                 
+                                                                                                  
+ res3d_branch2a (Conv2D)        (None, 4, 4, 128)    65664       ['activation_215[0][0]']         
+                                                                                                  
+ bn3d_branch2a (BatchNormalizat  (None, 4, 4, 128)   512         ['res3d_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_216 (Activation)    (None, 4, 4, 128)    0           ['bn3d_branch2a[0][0]']          
+                                                                                                  
+ res3d_branch2b (Conv2D)        (None, 4, 4, 128)    147584      ['activation_216[0][0]']         
+                                                                                                  
+ bn3d_branch2b (BatchNormalizat  (None, 4, 4, 128)   512         ['res3d_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_217 (Activation)    (None, 4, 4, 128)    0           ['bn3d_branch2b[0][0]']          
+                                                                                                  
+ res3d_branch2c (Conv2D)        (None, 4, 4, 512)    66048       ['activation_217[0][0]']         
+                                                                                                  
+ bn3d_branch2c (BatchNormalizat  (None, 4, 4, 512)   2048        ['res3d_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_54 (Add)                   (None, 4, 4, 512)    0           ['bn3d_branch2c[0][0]',          
+                                                                  'activation_215[0][0]']         
+                                                                                                  
+ activation_218 (Activation)    (None, 4, 4, 512)    0           ['add_54[0][0]']                 
+                                                                                                  
+ res4a_branch2a (Conv2D)        (None, 2, 2, 256)    131328      ['activation_218[0][0]']         
+                                                                                                  
+ bn4a_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_219 (Activation)    (None, 2, 2, 256)    0           ['bn4a_branch2a[0][0]']          
+                                                                                                  
+ res4a_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_219[0][0]']         
+                                                                                                  
+ bn4a_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_220 (Activation)    (None, 2, 2, 256)    0           ['bn4a_branch2b[0][0]']          
+                                                                                                  
+ res4a_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_220[0][0]']         
+                                                                                                  
+ res4a_branch1 (Conv2D)         (None, 2, 2, 1024)   525312      ['activation_218[0][0]']         
+                                                                                                  
+ bn4a_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4a_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn4a_branch1 (BatchNormalizati  (None, 2, 2, 1024)  4096        ['res4a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_55 (Add)                   (None, 2, 2, 1024)   0           ['bn4a_branch2c[0][0]',          
+                                                                  'bn4a_branch1[0][0]']           
+                                                                                                  
+ activation_221 (Activation)    (None, 2, 2, 1024)   0           ['add_55[0][0]']                 
+                                                                                                  
+ res4b_branch2a (Conv2D)        (None, 2, 2, 256)    262400      ['activation_221[0][0]']         
+                                                                                                  
+ bn4b_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_222 (Activation)    (None, 2, 2, 256)    0           ['bn4b_branch2a[0][0]']          
+                                                                                                  
+ res4b_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_222[0][0]']         
+                                                                                                  
+ bn4b_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_223 (Activation)    (None, 2, 2, 256)    0           ['bn4b_branch2b[0][0]']          
+                                                                                                  
+ res4b_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_223[0][0]']         
+                                                                                                  
+ bn4b_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4b_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_56 (Add)                   (None, 2, 2, 1024)   0           ['bn4b_branch2c[0][0]',          
+                                                                  'activation_221[0][0]']         
+                                                                                                  
+ activation_224 (Activation)    (None, 2, 2, 1024)   0           ['add_56[0][0]']                 
+                                                                                                  
+ res4c_branch2a (Conv2D)        (None, 2, 2, 256)    262400      ['activation_224[0][0]']         
+                                                                                                  
+ bn4c_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_225 (Activation)    (None, 2, 2, 256)    0           ['bn4c_branch2a[0][0]']          
+                                                                                                  
+ res4c_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_225[0][0]']         
+                                                                                                  
+ bn4c_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_226 (Activation)    (None, 2, 2, 256)    0           ['bn4c_branch2b[0][0]']          
+                                                                                                  
+ res4c_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_226[0][0]']         
+                                                                                                  
+ bn4c_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4c_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_57 (Add)                   (None, 2, 2, 1024)   0           ['bn4c_branch2c[0][0]',          
+                                                                  'activation_224[0][0]']         
+                                                                                                  
+ activation_227 (Activation)    (None, 2, 2, 1024)   0           ['add_57[0][0]']                 
+                                                                                                  
+ res4d_branch2a (Conv2D)        (None, 2, 2, 256)    262400      ['activation_227[0][0]']         
+                                                                                                  
+ bn4d_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4d_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_228 (Activation)    (None, 2, 2, 256)    0           ['bn4d_branch2a[0][0]']          
+                                                                                                  
+ res4d_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_228[0][0]']         
+                                                                                                  
+ bn4d_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4d_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_229 (Activation)    (None, 2, 2, 256)    0           ['bn4d_branch2b[0][0]']          
+                                                                                                  
+ res4d_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_229[0][0]']         
+                                                                                                  
+ bn4d_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4d_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_58 (Add)                   (None, 2, 2, 1024)   0           ['bn4d_branch2c[0][0]',          
+                                                                  'activation_227[0][0]']         
+                                                                                                  
+ activation_230 (Activation)    (None, 2, 2, 1024)   0           ['add_58[0][0]']                 
+                                                                                                  
+ res4e_branch2a (Conv2D)        (None, 2, 2, 256)    262400      ['activation_230[0][0]']         
+                                                                                                  
+ bn4e_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4e_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_231 (Activation)    (None, 2, 2, 256)    0           ['bn4e_branch2a[0][0]']          
+                                                                                                  
+ res4e_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_231[0][0]']         
+                                                                                                  
+ bn4e_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4e_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_232 (Activation)    (None, 2, 2, 256)    0           ['bn4e_branch2b[0][0]']          
+                                                                                                  
+ res4e_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_232[0][0]']         
+                                                                                                  
+ bn4e_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4e_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_59 (Add)                   (None, 2, 2, 1024)   0           ['bn4e_branch2c[0][0]',          
+                                                                  'activation_230[0][0]']         
+                                                                                                  
+ activation_233 (Activation)    (None, 2, 2, 1024)   0           ['add_59[0][0]']                 
+                                                                                                  
+ res4f_branch2a (Conv2D)        (None, 2, 2, 256)    262400      ['activation_233[0][0]']         
+                                                                                                  
+ bn4f_branch2a (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4f_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_234 (Activation)    (None, 2, 2, 256)    0           ['bn4f_branch2a[0][0]']          
+                                                                                                  
+ res4f_branch2b (Conv2D)        (None, 2, 2, 256)    590080      ['activation_234[0][0]']         
+                                                                                                  
+ bn4f_branch2b (BatchNormalizat  (None, 2, 2, 256)   1024        ['res4f_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_235 (Activation)    (None, 2, 2, 256)    0           ['bn4f_branch2b[0][0]']          
+                                                                                                  
+ res4f_branch2c (Conv2D)        (None, 2, 2, 1024)   263168      ['activation_235[0][0]']         
+                                                                                                  
+ bn4f_branch2c (BatchNormalizat  (None, 2, 2, 1024)  4096        ['res4f_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_60 (Add)                   (None, 2, 2, 1024)   0           ['bn4f_branch2c[0][0]',          
+                                                                  'activation_233[0][0]']         
+                                                                                                  
+ activation_236 (Activation)    (None, 2, 2, 1024)   0           ['add_60[0][0]']                 
+                                                                                                  
+ res5a_branch2a (Conv2D)        (None, 1, 1, 512)    524800      ['activation_236[0][0]']         
+                                                                                                  
+ bn5a_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5a_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_237 (Activation)    (None, 1, 1, 512)    0           ['bn5a_branch2a[0][0]']          
+                                                                                                  
+ res5a_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_237[0][0]']         
+                                                                                                  
+ bn5a_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5a_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_238 (Activation)    (None, 1, 1, 512)    0           ['bn5a_branch2b[0][0]']          
+                                                                                                  
+ res5a_branch2c (Conv2D)        (None, 1, 1, 2048)   1050624     ['activation_238[0][0]']         
+                                                                                                  
+ res5a_branch1 (Conv2D)         (None, 1, 1, 2048)   2099200     ['activation_236[0][0]']         
+                                                                                                  
+ bn5a_branch2c (BatchNormalizat  (None, 1, 1, 2048)  8192        ['res5a_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ bn5a_branch1 (BatchNormalizati  (None, 1, 1, 2048)  8192        ['res5a_branch1[0][0]']          
+ on)                                                                                              
+                                                                                                  
+ add_61 (Add)                   (None, 1, 1, 2048)   0           ['bn5a_branch2c[0][0]',          
+                                                                  'bn5a_branch1[0][0]']           
+                                                                                                  
+ activation_239 (Activation)    (None, 1, 1, 2048)   0           ['add_61[0][0]']                 
+                                                                                                  
+ res5b_branch2a (Conv2D)        (None, 1, 1, 512)    1049088     ['activation_239[0][0]']         
+                                                                                                  
+ bn5b_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5b_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_240 (Activation)    (None, 1, 1, 512)    0           ['bn5b_branch2a[0][0]']          
+                                                                                                  
+ res5b_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_240[0][0]']         
+                                                                                                  
+ bn5b_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5b_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_241 (Activation)    (None, 1, 1, 512)    0           ['bn5b_branch2b[0][0]']          
+                                                                                                  
+ res5b_branch2c (Conv2D)        (None, 1, 1, 2048)   1050624     ['activation_241[0][0]']         
+                                                                                                  
+ bn5b_branch2c (BatchNormalizat  (None, 1, 1, 2048)  8192        ['res5b_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_62 (Add)                   (None, 1, 1, 2048)   0           ['bn5b_branch2c[0][0]',          
+                                                                  'activation_239[0][0]']         
+                                                                                                  
+ activation_242 (Activation)    (None, 1, 1, 2048)   0           ['add_62[0][0]']                 
+                                                                                                  
+ res5c_branch2a (Conv2D)        (None, 1, 1, 512)    1049088     ['activation_242[0][0]']         
+                                                                                                  
+ bn5c_branch2a (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5c_branch2a[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_243 (Activation)    (None, 1, 1, 512)    0           ['bn5c_branch2a[0][0]']          
+                                                                                                  
+ res5c_branch2b (Conv2D)        (None, 1, 1, 512)    2359808     ['activation_243[0][0]']         
+                                                                                                  
+ bn5c_branch2b (BatchNormalizat  (None, 1, 1, 512)   2048        ['res5c_branch2b[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ activation_244 (Activation)    (None, 1, 1, 512)    0           ['bn5c_branch2b[0][0]']          
+                                                                                                  
+ res5c_branch2c (Conv2D)        (None, 1, 1, 2048)   1050624     ['activation_244[0][0]']         
+                                                                                                  
+ bn5c_branch2c (BatchNormalizat  (None, 1, 1, 2048)  8192        ['res5c_branch2c[0][0]']         
+ ion)                                                                                             
+                                                                                                  
+ add_63 (Add)                   (None, 1, 1, 2048)   0           ['bn5c_branch2c[0][0]',          
+                                                                  'activation_242[0][0]']         
+                                                                                                  
+ activation_245 (Activation)    (None, 1, 1, 2048)   0           ['add_63[0][0]']                 
+                                                                                                  
+ average_pooling2d_5 (AveragePo  (None, 1, 1, 2048)  0           ['activation_245[0][0]']         
+ oling2D)                                                                                         
+                                                                                                  
+ flatten_5 (Flatten)            (None, 2048)         0           ['average_pooling2d_5[0][0]']    
+                                                                                                  
+ fc1 (Dense)                    (None, 256)          524544      ['flatten_5[0][0]']              
+                                                                                                  
+ fc2 (Dense)                    (None, 128)          32896       ['fc1[0][0]']                    
+                                                                                                  
+ fc3 (Dense)                    (None, 2)            258         ['fc2[0][0]']                    
+                                                                                                  
+==================================================================================================
+Total params: 24,145,410
+Trainable params: 24,092,290
+Non-trainable params: 53,120
+__________________________________________________________________________________________________
+</pre>
+---
+
+## Model Train
+
+---
+
+
+### Model checkpoint 설정
+
+
+
+```python
+es = EarlyStopping(patience=20) 
+mc34 = ModelCheckpoint("/content/drive/MyDrive/AIFFEL/G12/ckpt34.h5", save_best_only=True)
+mc50 = ModelCheckpoint("/content/drive/MyDrive/AIFFEL/G12/ckpt50.h5", save_best_only=True)
+```
+
+
+```python
+BATCH_SIZE = 32
+EPOCH = 100
+```
+
+
+```python
+ds_train = apply_normalize_on_dataset(ds_train, batch_size=BATCH_SIZE)
+ds_test = apply_normalize_on_dataset(ds_test, batch_size=BATCH_SIZE)
+```
+
+
+```python
+resnet34.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=tf.keras.optimizers.SGD(lr=0.001, clipnorm=1.),
+    metrics=['accuracy'],
+)
+```
+
+<pre>
+/usr/local/lib/python3.7/dist-packages/keras/optimizer_v2/gradient_descent.py:102: UserWarning: The `lr` argument is deprecated, use `learning_rate` instead.
+  super(SGD, self).__init__(name, **kwargs)
+</pre>
+
+```python
+history_34 = resnet34.fit(
+    ds_train,
+    steps_per_epoch=int(ds_info.splits['train[:85%]'].num_examples/BATCH_SIZE),
+    validation_steps=int(ds_info.splits['train[85%:]'].num_examples/BATCH_SIZE),
+    epochs=EPOCH,
+    validation_data=ds_test,
+    verbose=1,
+    use_multiprocessing=True,
+    callbacks=[es, mc34]
+)
+```
+
+<pre>
+Epoch 1/100
+617/617 [==============================] - 47s 46ms/step - loss: 0.8631 - accuracy: 0.5092 - val_loss: 0.7770 - val_accuracy: 0.5249
+Epoch 2/100
+617/617 [==============================] - 28s 46ms/step - loss: 0.7322 - accuracy: 0.5599 - val_loss: 0.7666 - val_accuracy: 0.5201
+Epoch 3/100
+617/617 [==============================] - 28s 46ms/step - loss: 0.7195 - accuracy: 0.5516 - val_loss: 0.7531 - val_accuracy: 0.5161
+Epoch 4/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.6655 - accuracy: 0.6041 - val_loss: 0.7338 - val_accuracy: 0.5304
+Epoch 5/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.6531 - accuracy: 0.6135 - val_loss: 0.7394 - val_accuracy: 0.5318
+Epoch 6/100
+617/617 [==============================] - 29s 46ms/step - loss: 0.6373 - accuracy: 0.6370 - val_loss: 0.7278 - val_accuracy: 0.5331
+Epoch 7/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.5701 - accuracy: 0.7063 - val_loss: 0.7525 - val_accuracy: 0.5259
+Epoch 8/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.5650 - accuracy: 0.7076 - val_loss: 0.7564 - val_accuracy: 0.5290
+Epoch 9/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.5561 - accuracy: 0.7160 - val_loss: 0.7540 - val_accuracy: 0.5318
+Epoch 10/100
+617/617 [==============================] - 28s 46ms/step - loss: 0.5361 - accuracy: 0.7323 - val_loss: 0.7486 - val_accuracy: 0.5557
+Epoch 11/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.5484 - accuracy: 0.7210 - val_loss: 0.7609 - val_accuracy: 0.5605
+Epoch 12/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4944 - accuracy: 0.7639 - val_loss: 0.7755 - val_accuracy: 0.5473
+Epoch 13/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4516 - accuracy: 0.7931 - val_loss: 0.7929 - val_accuracy: 0.5539
+Epoch 14/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4172 - accuracy: 0.8177 - val_loss: 0.8024 - val_accuracy: 0.5519
+Epoch 15/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4277 - accuracy: 0.8025 - val_loss: 0.8359 - val_accuracy: 0.5409
+Epoch 16/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4049 - accuracy: 0.8211 - val_loss: 0.8596 - val_accuracy: 0.5499
+Epoch 17/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.4305 - accuracy: 0.8006 - val_loss: 0.8551 - val_accuracy: 0.5606
+Epoch 18/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.3490 - accuracy: 0.8566 - val_loss: 0.8969 - val_accuracy: 0.5508
+Epoch 19/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.3067 - accuracy: 0.8781 - val_loss: 0.8985 - val_accuracy: 0.5626
+Epoch 20/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.2511 - accuracy: 0.9060 - val_loss: 0.9591 - val_accuracy: 0.5522
+Epoch 21/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.2453 - accuracy: 0.9080 - val_loss: 1.0125 - val_accuracy: 0.5731
+Epoch 22/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.2535 - accuracy: 0.9019 - val_loss: 1.0785 - val_accuracy: 0.5476
+Epoch 23/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.3270 - accuracy: 0.8579 - val_loss: 1.0258 - val_accuracy: 0.5525
+Epoch 24/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.3677 - accuracy: 0.8374 - val_loss: 1.0246 - val_accuracy: 0.5482
+Epoch 25/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.2383 - accuracy: 0.9057 - val_loss: 1.1006 - val_accuracy: 0.5442
+Epoch 26/100
+617/617 [==============================] - 28s 45ms/step - loss: 0.2143 - accuracy: 0.9155 - val_loss: 1.1220 - val_accuracy: 0.5593
+</pre>
+
+```python
+resnet50.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=tf.keras.optimizers.SGD(lr=0.002, clipnorm=1.),
+    metrics=['accuracy'],
+)
+```
+
+<pre>
+/usr/local/lib/python3.7/dist-packages/keras/optimizer_v2/gradient_descent.py:102: UserWarning: The `lr` argument is deprecated, use `learning_rate` instead.
+  super(SGD, self).__init__(name, **kwargs)
+</pre>
+
+```python
+history_50 = resnet50.fit(
+    ds_train,
+    steps_per_epoch=int(ds_info.splits['train[:85%]'].num_examples/BATCH_SIZE),
+    validation_steps=int(ds_info.splits['train[85%:]'].num_examples/BATCH_SIZE),
+    epochs=EPOCH,
+    validation_data=ds_test,
+    verbose=1,
+    use_multiprocessing=True,
+    callbacks=[es, mc50]
+)
+```
+
+<pre>
+Epoch 1/100
+617/617 [==============================] - 45s 53ms/step - loss: 0.9120 - accuracy: 0.5044 - val_loss: 0.8145 - val_accuracy: 0.5077
+Epoch 2/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.7780 - accuracy: 0.5063 - val_loss: 0.7678 - val_accuracy: 0.5012
+Epoch 3/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.7420 - accuracy: 0.5084 - val_loss: 0.7322 - val_accuracy: 0.5155
+Epoch 4/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.7240 - accuracy: 0.5017 - val_loss: 0.7225 - val_accuracy: 0.4990
+Epoch 5/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.7107 - accuracy: 0.5144 - val_loss: 0.7155 - val_accuracy: 0.5029
+Epoch 6/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.7079 - accuracy: 0.5072 - val_loss: 0.7083 - val_accuracy: 0.5163
+Epoch 7/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.7046 - accuracy: 0.5077 - val_loss: 0.7152 - val_accuracy: 0.4779
+Epoch 8/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6995 - accuracy: 0.5185 - val_loss: 0.7110 - val_accuracy: 0.5032
+Epoch 9/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6988 - accuracy: 0.5201 - val_loss: 0.7046 - val_accuracy: 0.4964
+Epoch 10/100
+617/617 [==============================] - 32s 53ms/step - loss: 0.6968 - accuracy: 0.5190 - val_loss: 0.6995 - val_accuracy: 0.5054
+Epoch 11/100
+617/617 [==============================] - 32s 53ms/step - loss: 0.6951 - accuracy: 0.5241 - val_loss: 0.6955 - val_accuracy: 0.5172
+Epoch 12/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6948 - accuracy: 0.5230 - val_loss: 0.6996 - val_accuracy: 0.5082
+Epoch 13/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6927 - accuracy: 0.5290 - val_loss: 0.6992 - val_accuracy: 0.5181
+Epoch 14/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6921 - accuracy: 0.5261 - val_loss: 0.6926 - val_accuracy: 0.5323
+Epoch 15/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6918 - accuracy: 0.5305 - val_loss: 0.6912 - val_accuracy: 0.5324
+Epoch 16/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6930 - accuracy: 0.5277 - val_loss: 0.6924 - val_accuracy: 0.5149
+Epoch 17/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6903 - accuracy: 0.5343 - val_loss: 0.6993 - val_accuracy: 0.5088
+Epoch 18/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.6919 - accuracy: 0.5285 - val_loss: 0.6905 - val_accuracy: 0.5531
+Epoch 19/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6889 - accuracy: 0.5406 - val_loss: 0.6909 - val_accuracy: 0.5399
+Epoch 20/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6860 - accuracy: 0.5522 - val_loss: 0.6893 - val_accuracy: 0.5404
+Epoch 21/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6861 - accuracy: 0.5492 - val_loss: 0.6951 - val_accuracy: 0.5353
+Epoch 22/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6811 - accuracy: 0.5633 - val_loss: 0.6995 - val_accuracy: 0.5290
+Epoch 23/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6805 - accuracy: 0.5647 - val_loss: 0.6897 - val_accuracy: 0.5505
+Epoch 24/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6783 - accuracy: 0.5708 - val_loss: 0.6955 - val_accuracy: 0.5351
+Epoch 25/100
+617/617 [==============================] - 34s 55ms/step - loss: 0.6780 - accuracy: 0.5750 - val_loss: 0.6858 - val_accuracy: 0.5644
+Epoch 26/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6754 - accuracy: 0.5765 - val_loss: 0.6910 - val_accuracy: 0.5444
+Epoch 27/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6720 - accuracy: 0.5866 - val_loss: 0.6905 - val_accuracy: 0.5525
+Epoch 28/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6713 - accuracy: 0.5823 - val_loss: 0.6823 - val_accuracy: 0.5780
+Epoch 29/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6680 - accuracy: 0.5883 - val_loss: 0.6780 - val_accuracy: 0.5785
+Epoch 30/100
+617/617 [==============================] - 32s 53ms/step - loss: 0.6629 - accuracy: 0.6005 - val_loss: 0.6825 - val_accuracy: 0.5840
+Epoch 31/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6604 - accuracy: 0.6018 - val_loss: 0.6864 - val_accuracy: 0.5733
+Epoch 32/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6579 - accuracy: 0.6065 - val_loss: 0.6827 - val_accuracy: 0.5800
+Epoch 33/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6537 - accuracy: 0.6107 - val_loss: 0.6832 - val_accuracy: 0.5880
+Epoch 34/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6451 - accuracy: 0.6228 - val_loss: 0.6833 - val_accuracy: 0.5886
+Epoch 35/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6467 - accuracy: 0.6229 - val_loss: 0.6936 - val_accuracy: 0.5803
+Epoch 36/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.6455 - accuracy: 0.6236 - val_loss: 0.6811 - val_accuracy: 0.5754
+Epoch 37/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6371 - accuracy: 0.6341 - val_loss: 0.6831 - val_accuracy: 0.5979
+Epoch 38/100
+617/617 [==============================] - 34s 54ms/step - loss: 0.6327 - accuracy: 0.6434 - val_loss: 0.6777 - val_accuracy: 0.5811
+Epoch 39/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6350 - accuracy: 0.6389 - val_loss: 0.6841 - val_accuracy: 0.5829
+Epoch 40/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6286 - accuracy: 0.6459 - val_loss: 0.6796 - val_accuracy: 0.5918
+Epoch 41/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.6244 - accuracy: 0.6468 - val_loss: 0.6748 - val_accuracy: 0.6023
+Epoch 42/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.6118 - accuracy: 0.6662 - val_loss: 0.6846 - val_accuracy: 0.5947
+Epoch 43/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.6100 - accuracy: 0.6640 - val_loss: 0.6788 - val_accuracy: 0.5962
+Epoch 44/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.6099 - accuracy: 0.6631 - val_loss: 0.6945 - val_accuracy: 0.6077
+Epoch 45/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.6053 - accuracy: 0.6721 - val_loss: 0.6727 - val_accuracy: 0.6147
+Epoch 46/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.5922 - accuracy: 0.6823 - val_loss: 0.6893 - val_accuracy: 0.6028
+Epoch 47/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.5896 - accuracy: 0.6838 - val_loss: 0.6831 - val_accuracy: 0.6057
+Epoch 48/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.5870 - accuracy: 0.6914 - val_loss: 0.6877 - val_accuracy: 0.6165
+Epoch 49/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.5798 - accuracy: 0.6950 - val_loss: 0.6805 - val_accuracy: 0.6115
+Epoch 50/100
+617/617 [==============================] - 33s 54ms/step - loss: 0.5814 - accuracy: 0.6915 - val_loss: 0.6695 - val_accuracy: 0.6207
+Epoch 51/100
+617/617 [==============================] - 33s 53ms/step - loss: 0.5782 - accuracy: 0.6951 - val_loss: 0.6866 - val_accuracy: 0.6198
+Epoch 52/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5641 - accuracy: 0.7071 - val_loss: 0.6944 - val_accuracy: 0.6220
+Epoch 53/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5529 - accuracy: 0.7146 - val_loss: 0.7055 - val_accuracy: 0.6150
+Epoch 54/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5411 - accuracy: 0.7220 - val_loss: 0.7035 - val_accuracy: 0.6173
+Epoch 55/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5413 - accuracy: 0.7254 - val_loss: 0.6993 - val_accuracy: 0.6184
+Epoch 56/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5279 - accuracy: 0.7314 - val_loss: 0.7097 - val_accuracy: 0.5991
+Epoch 57/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5270 - accuracy: 0.7358 - val_loss: 0.7276 - val_accuracy: 0.6121
+Epoch 58/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5175 - accuracy: 0.7428 - val_loss: 0.7239 - val_accuracy: 0.6150
+Epoch 59/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.5007 - accuracy: 0.7550 - val_loss: 0.7370 - val_accuracy: 0.6218
+Epoch 60/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4792 - accuracy: 0.7716 - val_loss: 0.7346 - val_accuracy: 0.6185
+Epoch 61/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4633 - accuracy: 0.7833 - val_loss: 0.7506 - val_accuracy: 0.6280
+Epoch 62/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4777 - accuracy: 0.7720 - val_loss: 0.7585 - val_accuracy: 0.6121
+Epoch 63/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4641 - accuracy: 0.7792 - val_loss: 0.7358 - val_accuracy: 0.6224
+Epoch 64/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4605 - accuracy: 0.7818 - val_loss: 0.7780 - val_accuracy: 0.6240
+Epoch 65/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4497 - accuracy: 0.7886 - val_loss: 0.7814 - val_accuracy: 0.6205
+Epoch 66/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4274 - accuracy: 0.8038 - val_loss: 0.7830 - val_accuracy: 0.6211
+Epoch 67/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4144 - accuracy: 0.8104 - val_loss: 0.7686 - val_accuracy: 0.6304
+Epoch 68/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4186 - accuracy: 0.8040 - val_loss: 0.7591 - val_accuracy: 0.6245
+Epoch 69/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4096 - accuracy: 0.8132 - val_loss: 0.8002 - val_accuracy: 0.6098
+Epoch 70/100
+617/617 [==============================] - 32s 52ms/step - loss: 0.4035 - accuracy: 0.8165 - val_loss: 0.8343 - val_accuracy: 0.6115
+</pre>
+
+```python
+import matplotlib.pyplot as plt
+
+plt.plot(history_34.history['loss'], 'r')
+plt.plot(history_50.history['loss'], 'b')
+plt.title('Model training loss')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['ResNet34', 'ResNet50'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+
+```python
+plt.plot(history_34.history['val_accuracy'], 'r')
+plt.plot(history_50.history['val_accuracy'], 'b')
+plt.title('Model validation accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(['ResNet34', 'ResNet50'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+---
+
+Ablation study
+
+---
+
+Plain34와 Plain50 을 구성한다.
+
+
+
+```python
+
+```
+
+
+```python
+### Plain34 구성단위
+def plain(X, f, filters, stage, block, s=2):
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    F1, F2, F3 = filters
+
+    X = Conv2D(filters=F1, kernel_size=(f, f), strides=(s, s), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+    X = Activation('relu')(X)
+
+    return X
+
+### Plain50 구성단위
+def plain50(X, f, filters, stage, block, s=2):
+   
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    F1, F2, F3 = filters
+
+    X = Conv2D(filters=F1, kernel_size=(1, 1), strides=(s, s), kernel_initializer='he_normal', name=conv_name_base + '2a')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2a')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F2, kernel_size=(f, f), strides=(1, 1), padding='same', kernel_initializer='he_normal', name=conv_name_base + '2b')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2b')(X)
+    X = Activation('relu')(X)
+
+    X = Conv2D(filters=F3, kernel_size=(1, 1), strides=(1, 1), kernel_initializer='he_normal', name=conv_name_base + '2c')(X)
+    X = BatchNormalization(axis=3, name=bn_name_base + '2c')(X)
+    X = Activation('relu')(X)
+
+    return X
+```
+
+
+```python
+def PlainNet(input_shape=(32, 32, 3), is_50=False):
+
+    X_input = Input(input_shape)
+
+    X = ZeroPadding2D((3, 3))(X_input)
+
+    X = Conv2D(64, (7, 7), strides=(2, 2), kernel_initializer='he_normal', name='conv1')(X)
+    X = BatchNormalization(axis=3, name='bn_conv1')(X)
+    X = Activation('relu')(X)
+    X = MaxPooling2D((3, 3), strides=(2, 2))(X)
+
+
+    if is_50 == False: #Plain34를 구현
+        pass 
+        X = plain(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
+        X = plain(X, 3, [64, 64, 256], stage=2, block='b')
+        X = plain(X, 3, [64, 64, 256], stage=2, block='c')
+
+
+        X = plain(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
+        X = plain(X, 3, [128, 128, 512], stage=3, block='b')
+        X = plain(X, 3, [128, 128, 512], stage=3, block='c')
+        X = plain(X, 3, [128, 128, 512], stage=3, block='d')
+
+        X = plain(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
+        X = plain(X, 3, [256, 256, 1024], stage=4, block='b')
+        X = plain(X, 3, [256, 256, 1024], stage=4, block='c')
+        X = plain(X, 3, [256, 256, 1024], stage=4, block='d')
+        X = plain(X, 3, [256, 256, 1024], stage=4, block='e')
+        X = plain(X, 3, [256, 256, 1024], stage=4, block='f')
+
+        X = X = plain(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
+        X = plain(X, 3, [512, 512, 2048], stage=5, block='b')
+        X = plain(X, 3, [512, 512, 2048], stage=5, block='c')
+
+        X = AveragePooling2D(pool_size=(2, 2), padding='same')(X)
+        
+        model = Model(inputs=X_input, outputs=X, name='ResNet34')
+
+        return model
+
+
+    else:
+        X = plain50(X, f=3, filters=[64, 64, 256], stage=2, block='a', s=1)
+        X = plain50(X, 3, [64, 64, 256], stage=2, block='b')
+        X = plain50(X, 3, [64, 64, 256], stage=2, block='c')
+
+
+        X = plain50(X, f=3, filters=[128, 128, 512], stage=3, block='a', s=2)
+        X = plain50(X, 3, [128, 128, 512], stage=3, block='b')
+        X = plain50(X, 3, [128, 128, 512], stage=3, block='c')
+        X = plain50(X, 3, [128, 128, 512], stage=3, block='d')
+
+        X = plain50(X, f=3, filters=[256, 256, 1024], stage=4, block='a', s=2)
+        X = plain50(X, 3, [256, 256, 1024], stage=4, block='b')
+        X = plain50(X, 3, [256, 256, 1024], stage=4, block='c')
+        X = plain50(X, 3, [256, 256, 1024], stage=4, block='d')
+        X = plain50(X, 3, [256, 256, 1024], stage=4, block='e')
+        X = plain50(X, 3, [256, 256, 1024], stage=4, block='f')
+
+        X = plain50(X, f=3, filters=[512, 512, 2048], stage=5, block='a', s=2)
+        X = plain50(X, 3, [512, 512, 2048], stage=5, block='b')
+        X = plain50(X, 3, [512, 512, 2048], stage=5, block='c')
+
+        X = AveragePooling2D(pool_size=(2, 2), padding='same')(X)
+        
+        model = Model(inputs=X_input, outputs=X, name='ResNet50')
+
+        return model
+```
+
+
+```python
+plainnet34 = PlainNet(input_shape=(32, 32, 3), is_50=False)
+plainnet50 = PlainNet(input_shape=(32, 32, 3), is_50=True)
+```
+
+
+```python
+headModel = plainnet34.output
+headModel = Flatten()(headModel)
+headModel=Dense(256, activation='relu', name='fc1',kernel_initializer='he_normal')(headModel)
+headModel=Dense(128, activation='relu', name='fc2',kernel_initializer='he_normal')(headModel)
+headModel = Dense(2,activation='sigmoid', name='fc3',kernel_initializer='he_normal')(headModel)
+plainnet34 = Model(inputs=plainnet34.input, outputs=headModel)
+
+headModel = plainnet50.output
+headModel = Flatten()(headModel)
+headModel=Dense(256, activation='relu', name='fc1',kernel_initializer='he_normal')(headModel)
+headModel=Dense(128, activation='relu', name='fc2',kernel_initializer='he_normal')(headModel)
+headModel = Dense(2,activation='sigmoid', name='fc3',kernel_initializer='he_normal')(headModel)
+plainnet50 = Model(inputs=plainnet50.input, outputs=headModel)
+```
+
+
+```python
+plainnet34.summary()
+```
+
+<pre>
+Model: "model_6"
+_________________________________________________________________
+ Layer (type)                Output Shape              Param #   
+=================================================================
+ input_7 (InputLayer)        [(None, 32, 32, 3)]       0         
+                                                                 
+ zero_padding2d_6 (ZeroPaddi  (None, 38, 38, 3)        0         
+ ng2D)                                                           
+                                                                 
+ conv1 (Conv2D)              (None, 16, 16, 64)        9472      
+                                                                 
+ bn_conv1 (BatchNormalizatio  (None, 16, 16, 64)       256       
+ n)                                                              
+                                                                 
+ activation_246 (Activation)  (None, 16, 16, 64)       0         
+                                                                 
+ max_pooling2d_6 (MaxPooling  (None, 7, 7, 64)         0         
+ 2D)                                                             
+                                                                 
+ res2a_branch2a (Conv2D)     (None, 7, 7, 64)          36928     
+                                                                 
+ bn2a_branch2a (BatchNormali  (None, 7, 7, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_247 (Activation)  (None, 7, 7, 64)         0         
+                                                                 
+ res2a_branch2b (Conv2D)     (None, 7, 7, 64)          36928     
+                                                                 
+ bn2a_branch2b (BatchNormali  (None, 7, 7, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_248 (Activation)  (None, 7, 7, 64)         0         
+                                                                 
+ res2b_branch2a (Conv2D)     (None, 4, 4, 64)          36928     
+                                                                 
+ bn2b_branch2a (BatchNormali  (None, 4, 4, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_249 (Activation)  (None, 4, 4, 64)         0         
+                                                                 
+ res2b_branch2b (Conv2D)     (None, 4, 4, 64)          36928     
+                                                                 
+ bn2b_branch2b (BatchNormali  (None, 4, 4, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_250 (Activation)  (None, 4, 4, 64)         0         
+                                                                 
+ res2c_branch2a (Conv2D)     (None, 2, 2, 64)          36928     
+                                                                 
+ bn2c_branch2a (BatchNormali  (None, 2, 2, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_251 (Activation)  (None, 2, 2, 64)         0         
+                                                                 
+ res2c_branch2b (Conv2D)     (None, 2, 2, 64)          36928     
+                                                                 
+ bn2c_branch2b (BatchNormali  (None, 2, 2, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_252 (Activation)  (None, 2, 2, 64)         0         
+                                                                 
+ res3a_branch2a (Conv2D)     (None, 1, 1, 128)         73856     
+                                                                 
+ bn3a_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_253 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3a_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3a_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_254 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3b_branch2a (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3b_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_255 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3b_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3b_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_256 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3c_branch2a (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3c_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_257 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3c_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3c_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_258 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3d_branch2a (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3d_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_259 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3d_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3d_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_260 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res4a_branch2a (Conv2D)     (None, 1, 1, 256)         295168    
+                                                                 
+ bn4a_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_261 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4a_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4a_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_262 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4b_branch2a (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4b_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_263 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4b_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4b_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_264 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4c_branch2a (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4c_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_265 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4c_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4c_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_266 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4d_branch2a (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4d_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_267 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4d_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4d_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_268 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4e_branch2a (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4e_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_269 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4e_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4e_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_270 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4f_branch2a (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4f_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_271 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4f_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4f_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_272 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res5a_branch2a (Conv2D)     (None, 1, 1, 512)         1180160   
+                                                                 
+ bn5a_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_273 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5a_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5a_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_274 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5b_branch2a (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5b_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_275 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5b_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5b_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_276 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5c_branch2a (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5c_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_277 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5c_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5c_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_278 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ average_pooling2d_6 (Averag  (None, 1, 1, 512)        0         
+ ePooling2D)                                                     
+                                                                 
+ flatten_6 (Flatten)         (None, 512)               0         
+                                                                 
+ fc1 (Dense)                 (None, 256)               131328    
+                                                                 
+ fc2 (Dense)                 (None, 128)               32896     
+                                                                 
+ fc3 (Dense)                 (None, 2)                 258       
+                                                                 
+=================================================================
+Total params: 21,298,178
+Trainable params: 21,282,946
+Non-trainable params: 15,232
+_________________________________________________________________
+</pre>
+
+```python
+plainnet50.summary()
+```
+
+<pre>
+Model: "model_7"
+_________________________________________________________________
+ Layer (type)                Output Shape              Param #   
+=================================================================
+ input_8 (InputLayer)        [(None, 32, 32, 3)]       0         
+                                                                 
+ zero_padding2d_7 (ZeroPaddi  (None, 38, 38, 3)        0         
+ ng2D)                                                           
+                                                                 
+ conv1 (Conv2D)              (None, 16, 16, 64)        9472      
+                                                                 
+ bn_conv1 (BatchNormalizatio  (None, 16, 16, 64)       256       
+ n)                                                              
+                                                                 
+ activation_279 (Activation)  (None, 16, 16, 64)       0         
+                                                                 
+ max_pooling2d_7 (MaxPooling  (None, 7, 7, 64)         0         
+ 2D)                                                             
+                                                                 
+ res2a_branch2a (Conv2D)     (None, 7, 7, 64)          4160      
+                                                                 
+ bn2a_branch2a (BatchNormali  (None, 7, 7, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_280 (Activation)  (None, 7, 7, 64)         0         
+                                                                 
+ res2a_branch2b (Conv2D)     (None, 7, 7, 64)          36928     
+                                                                 
+ bn2a_branch2b (BatchNormali  (None, 7, 7, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_281 (Activation)  (None, 7, 7, 64)         0         
+                                                                 
+ res2a_branch2c (Conv2D)     (None, 7, 7, 256)         16640     
+                                                                 
+ bn2a_branch2c (BatchNormali  (None, 7, 7, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_282 (Activation)  (None, 7, 7, 256)        0         
+                                                                 
+ res2b_branch2a (Conv2D)     (None, 4, 4, 64)          16448     
+                                                                 
+ bn2b_branch2a (BatchNormali  (None, 4, 4, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_283 (Activation)  (None, 4, 4, 64)         0         
+                                                                 
+ res2b_branch2b (Conv2D)     (None, 4, 4, 64)          36928     
+                                                                 
+ bn2b_branch2b (BatchNormali  (None, 4, 4, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_284 (Activation)  (None, 4, 4, 64)         0         
+                                                                 
+ res2b_branch2c (Conv2D)     (None, 4, 4, 256)         16640     
+                                                                 
+ bn2b_branch2c (BatchNormali  (None, 4, 4, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_285 (Activation)  (None, 4, 4, 256)        0         
+                                                                 
+ res2c_branch2a (Conv2D)     (None, 2, 2, 64)          16448     
+                                                                 
+ bn2c_branch2a (BatchNormali  (None, 2, 2, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_286 (Activation)  (None, 2, 2, 64)         0         
+                                                                 
+ res2c_branch2b (Conv2D)     (None, 2, 2, 64)          36928     
+                                                                 
+ bn2c_branch2b (BatchNormali  (None, 2, 2, 64)         256       
+ zation)                                                         
+                                                                 
+ activation_287 (Activation)  (None, 2, 2, 64)         0         
+                                                                 
+ res2c_branch2c (Conv2D)     (None, 2, 2, 256)         16640     
+                                                                 
+ bn2c_branch2c (BatchNormali  (None, 2, 2, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_288 (Activation)  (None, 2, 2, 256)        0         
+                                                                 
+ res3a_branch2a (Conv2D)     (None, 1, 1, 128)         32896     
+                                                                 
+ bn3a_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_289 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3a_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3a_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_290 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3a_branch2c (Conv2D)     (None, 1, 1, 512)         66048     
+                                                                 
+ bn3a_branch2c (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_291 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res3b_branch2a (Conv2D)     (None, 1, 1, 128)         65664     
+                                                                 
+ bn3b_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_292 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3b_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3b_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_293 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3b_branch2c (Conv2D)     (None, 1, 1, 512)         66048     
+                                                                 
+ bn3b_branch2c (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_294 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res3c_branch2a (Conv2D)     (None, 1, 1, 128)         65664     
+                                                                 
+ bn3c_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_295 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3c_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3c_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_296 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3c_branch2c (Conv2D)     (None, 1, 1, 512)         66048     
+                                                                 
+ bn3c_branch2c (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_297 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res3d_branch2a (Conv2D)     (None, 1, 1, 128)         65664     
+                                                                 
+ bn3d_branch2a (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_298 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3d_branch2b (Conv2D)     (None, 1, 1, 128)         147584    
+                                                                 
+ bn3d_branch2b (BatchNormali  (None, 1, 1, 128)        512       
+ zation)                                                         
+                                                                 
+ activation_299 (Activation)  (None, 1, 1, 128)        0         
+                                                                 
+ res3d_branch2c (Conv2D)     (None, 1, 1, 512)         66048     
+                                                                 
+ bn3d_branch2c (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_300 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res4a_branch2a (Conv2D)     (None, 1, 1, 256)         131328    
+                                                                 
+ bn4a_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_301 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4a_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4a_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_302 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4a_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4a_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_303 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res4b_branch2a (Conv2D)     (None, 1, 1, 256)         262400    
+                                                                 
+ bn4b_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_304 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4b_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4b_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_305 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4b_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4b_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_306 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res4c_branch2a (Conv2D)     (None, 1, 1, 256)         262400    
+                                                                 
+ bn4c_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_307 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4c_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4c_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_308 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4c_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4c_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_309 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res4d_branch2a (Conv2D)     (None, 1, 1, 256)         262400    
+                                                                 
+ bn4d_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_310 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4d_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4d_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_311 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4d_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4d_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_312 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res4e_branch2a (Conv2D)     (None, 1, 1, 256)         262400    
+                                                                 
+ bn4e_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_313 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4e_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4e_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_314 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4e_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4e_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_315 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res4f_branch2a (Conv2D)     (None, 1, 1, 256)         262400    
+                                                                 
+ bn4f_branch2a (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_316 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4f_branch2b (Conv2D)     (None, 1, 1, 256)         590080    
+                                                                 
+ bn4f_branch2b (BatchNormali  (None, 1, 1, 256)        1024      
+ zation)                                                         
+                                                                 
+ activation_317 (Activation)  (None, 1, 1, 256)        0         
+                                                                 
+ res4f_branch2c (Conv2D)     (None, 1, 1, 1024)        263168    
+                                                                 
+ bn4f_branch2c (BatchNormali  (None, 1, 1, 1024)       4096      
+ zation)                                                         
+                                                                 
+ activation_318 (Activation)  (None, 1, 1, 1024)       0         
+                                                                 
+ res5a_branch2a (Conv2D)     (None, 1, 1, 512)         524800    
+                                                                 
+ bn5a_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_319 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5a_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5a_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_320 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5a_branch2c (Conv2D)     (None, 1, 1, 2048)        1050624   
+                                                                 
+ bn5a_branch2c (BatchNormali  (None, 1, 1, 2048)       8192      
+ zation)                                                         
+                                                                 
+ activation_321 (Activation)  (None, 1, 1, 2048)       0         
+                                                                 
+ res5b_branch2a (Conv2D)     (None, 1, 1, 512)         1049088   
+                                                                 
+ bn5b_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_322 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5b_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5b_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_323 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5b_branch2c (Conv2D)     (None, 1, 1, 2048)        1050624   
+                                                                 
+ bn5b_branch2c (BatchNormali  (None, 1, 1, 2048)       8192      
+ zation)                                                         
+                                                                 
+ activation_324 (Activation)  (None, 1, 1, 2048)       0         
+                                                                 
+ res5c_branch2a (Conv2D)     (None, 1, 1, 512)         1049088   
+                                                                 
+ bn5c_branch2a (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_325 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5c_branch2b (Conv2D)     (None, 1, 1, 512)         2359808   
+                                                                 
+ bn5c_branch2b (BatchNormali  (None, 1, 1, 512)        2048      
+ zation)                                                         
+                                                                 
+ activation_326 (Activation)  (None, 1, 1, 512)        0         
+                                                                 
+ res5c_branch2c (Conv2D)     (None, 1, 1, 2048)        1050624   
+                                                                 
+ bn5c_branch2c (BatchNormali  (None, 1, 1, 2048)       8192      
+ zation)                                                         
+                                                                 
+ activation_327 (Activation)  (None, 1, 1, 2048)       0         
+                                                                 
+ average_pooling2d_7 (Averag  (None, 1, 1, 2048)       0         
+ ePooling2D)                                                     
+                                                                 
+ flatten_7 (Flatten)         (None, 2048)              0         
+                                                                 
+ fc1 (Dense)                 (None, 256)               524544    
+                                                                 
+ fc2 (Dense)                 (None, 128)               32896     
+                                                                 
+ fc3 (Dense)                 (None, 2)                 258       
+                                                                 
+=================================================================
+Total params: 21,357,314
+Trainable params: 21,311,874
+Non-trainable params: 45,440
+_________________________________________________________________
+</pre>
+
+```python
+plainnet34.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=tf.keras.optimizers.SGD(lr=0.001, clipnorm=1.),
+    metrics=['accuracy'],
+)
+```
+
+<pre>
+/usr/local/lib/python3.7/dist-packages/keras/optimizer_v2/gradient_descent.py:102: UserWarning: The `lr` argument is deprecated, use `learning_rate` instead.
+  super(SGD, self).__init__(name, **kwargs)
+</pre>
+
+```python
+history_p34 = plainnet34.fit(
+    ds_train,
+    steps_per_epoch=int(ds_info.splits['train[:85%]'].num_examples/BATCH_SIZE),
+    validation_steps=int(ds_info.splits['train[85%:]'].num_examples/BATCH_SIZE),
+    epochs=26,
+    validation_data=ds_test,
+    verbose=1,
+    use_multiprocessing=True,
+)
+```
+
+<pre>
+Epoch 1/26
+617/617 [==============================] - 40s 51ms/step - loss: 0.7558 - accuracy: 0.4962 - val_loss: 0.7140 - val_accuracy: 0.5118
+Epoch 2/26
+617/617 [==============================] - 30s 48ms/step - loss: 0.7249 - accuracy: 0.4989 - val_loss: 0.7458 - val_accuracy: 0.4860
+Epoch 3/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7164 - accuracy: 0.4985 - val_loss: 0.7103 - val_accuracy: 0.5099
+Epoch 4/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7146 - accuracy: 0.4951 - val_loss: 0.7241 - val_accuracy: 0.4989
+Epoch 5/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7115 - accuracy: 0.4946 - val_loss: 0.7134 - val_accuracy: 0.4957
+Epoch 6/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7105 - accuracy: 0.4940 - val_loss: 0.7200 - val_accuracy: 0.4953
+Epoch 7/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7046 - accuracy: 0.5060 - val_loss: 0.7138 - val_accuracy: 0.4894
+Epoch 8/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7057 - accuracy: 0.5001 - val_loss: 0.7010 - val_accuracy: 0.5097
+Epoch 9/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7030 - accuracy: 0.5051 - val_loss: 0.7095 - val_accuracy: 0.4808
+Epoch 10/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7034 - accuracy: 0.5015 - val_loss: 0.7013 - val_accuracy: 0.5108
+Epoch 11/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7035 - accuracy: 0.4978 - val_loss: 0.7016 - val_accuracy: 0.4999
+Epoch 12/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6997 - accuracy: 0.5083 - val_loss: 0.7010 - val_accuracy: 0.5181
+Epoch 13/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7010 - accuracy: 0.4999 - val_loss: 0.7065 - val_accuracy: 0.5014
+Epoch 14/26
+617/617 [==============================] - 29s 48ms/step - loss: 0.7018 - accuracy: 0.4936 - val_loss: 0.6992 - val_accuracy: 0.5178
+Epoch 15/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.7010 - accuracy: 0.4964 - val_loss: 0.7001 - val_accuracy: 0.4935
+Epoch 16/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6993 - accuracy: 0.4985 - val_loss: 0.7087 - val_accuracy: 0.4967
+Epoch 17/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6982 - accuracy: 0.5022 - val_loss: 0.7055 - val_accuracy: 0.5106
+Epoch 18/26
+617/617 [==============================] - 31s 50ms/step - loss: 0.6982 - accuracy: 0.5009 - val_loss: 0.6989 - val_accuracy: 0.5166
+Epoch 19/26
+617/617 [==============================] - 31s 51ms/step - loss: 0.6992 - accuracy: 0.4956 - val_loss: 0.7024 - val_accuracy: 0.5025
+Epoch 20/26
+617/617 [==============================] - 30s 48ms/step - loss: 0.6995 - accuracy: 0.4925 - val_loss: 0.6988 - val_accuracy: 0.5022
+Epoch 21/26
+617/617 [==============================] - 29s 48ms/step - loss: 0.6977 - accuracy: 0.4980 - val_loss: 0.7054 - val_accuracy: 0.4834
+Epoch 22/26
+617/617 [==============================] - 29s 48ms/step - loss: 0.6978 - accuracy: 0.4969 - val_loss: 0.6993 - val_accuracy: 0.5080
+Epoch 23/26
+617/617 [==============================] - 29s 48ms/step - loss: 0.6966 - accuracy: 0.5061 - val_loss: 0.6999 - val_accuracy: 0.4923
+Epoch 24/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6971 - accuracy: 0.4976 - val_loss: 0.7053 - val_accuracy: 0.4848
+Epoch 25/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6964 - accuracy: 0.5045 - val_loss: 0.6974 - val_accuracy: 0.5067
+Epoch 26/26
+617/617 [==============================] - 29s 47ms/step - loss: 0.6966 - accuracy: 0.4997 - val_loss: 0.7039 - val_accuracy: 0.5029
+</pre>
+
+```python
+plainnet50.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=tf.keras.optimizers.SGD(lr=0.001, clipnorm=1.),
+    metrics=['accuracy'],
+)
+```
+
+<pre>
+/usr/local/lib/python3.7/dist-packages/keras/optimizer_v2/gradient_descent.py:102: UserWarning: The `lr` argument is deprecated, use `learning_rate` instead.
+  super(SGD, self).__init__(name, **kwargs)
+</pre>
+
+```python
+history_p50 = plainnet50.fit(
+    ds_train,
+    steps_per_epoch=int(ds_info.splits['train[:85%]'].num_examples/BATCH_SIZE),
+    validation_steps=int(ds_info.splits['train[85%:]'].num_examples/BATCH_SIZE),
+    epochs=70,
+    validation_data=ds_test,
+    verbose=1,
+    use_multiprocessing=True,
+)
+```
+
+<pre>
+Epoch 1/70
+617/617 [==============================] - 44s 53ms/step - loss: 0.7741 - accuracy: 0.4969 - val_loss: 1.0752 - val_accuracy: 0.4946
+Epoch 2/70
+617/617 [==============================] - 32s 51ms/step - loss: 0.7470 - accuracy: 0.4946 - val_loss: 0.9897 - val_accuracy: 0.5068
+Epoch 3/70
+617/617 [==============================] - 31s 51ms/step - loss: 0.7302 - accuracy: 0.5031 - val_loss: 0.9310 - val_accuracy: 0.5178
+Epoch 4/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.7253 - accuracy: 0.4916 - val_loss: 1.0359 - val_accuracy: 0.5146
+Epoch 5/70
+617/617 [==============================] - 32s 51ms/step - loss: 0.7172 - accuracy: 0.5033 - val_loss: 1.0611 - val_accuracy: 0.4968
+Epoch 6/70
+617/617 [==============================] - 32s 51ms/step - loss: 0.7187 - accuracy: 0.4966 - val_loss: 1.0484 - val_accuracy: 0.4934
+Epoch 7/70
+617/617 [==============================] - 32s 51ms/step - loss: 0.7115 - accuracy: 0.4968 - val_loss: 1.0185 - val_accuracy: 0.5082
+Epoch 8/70
+617/617 [==============================] - 32s 51ms/step - loss: 0.7105 - accuracy: 0.4983 - val_loss: 0.9025 - val_accuracy: 0.4871
+Epoch 9/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.7066 - accuracy: 0.4984 - val_loss: 0.8483 - val_accuracy: 0.5140
+Epoch 10/70
+617/617 [==============================] - 33s 54ms/step - loss: 0.7060 - accuracy: 0.4971 - val_loss: 0.8864 - val_accuracy: 0.5212
+Epoch 11/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.7060 - accuracy: 0.5009 - val_loss: 0.8125 - val_accuracy: 0.5102
+Epoch 12/70
+617/617 [==============================] - 33s 54ms/step - loss: 0.7050 - accuracy: 0.4949 - val_loss: 0.9007 - val_accuracy: 0.5066
+Epoch 13/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.7016 - accuracy: 0.5027 - val_loss: 0.8009 - val_accuracy: 0.5006
+Epoch 14/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.7026 - accuracy: 0.4966 - val_loss: 0.7954 - val_accuracy: 0.4908
+Epoch 15/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.7011 - accuracy: 0.5000 - val_loss: 0.7751 - val_accuracy: 0.4929
+Epoch 16/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.7007 - accuracy: 0.4946 - val_loss: 0.8028 - val_accuracy: 0.4927
+Epoch 17/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6987 - accuracy: 0.5040 - val_loss: 0.8191 - val_accuracy: 0.5043
+Epoch 18/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6996 - accuracy: 0.5003 - val_loss: 0.8093 - val_accuracy: 0.5126
+Epoch 19/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6999 - accuracy: 0.4989 - val_loss: 0.7364 - val_accuracy: 0.5016
+Epoch 20/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6986 - accuracy: 0.4992 - val_loss: 0.7501 - val_accuracy: 0.5106
+Epoch 21/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6989 - accuracy: 0.4998 - val_loss: 0.8690 - val_accuracy: 0.4923
+Epoch 22/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6990 - accuracy: 0.4963 - val_loss: 0.8245 - val_accuracy: 0.5019
+Epoch 23/70
+617/617 [==============================] - 33s 54ms/step - loss: 0.6983 - accuracy: 0.4985 - val_loss: 0.7404 - val_accuracy: 0.4874
+Epoch 24/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6971 - accuracy: 0.5036 - val_loss: 0.7671 - val_accuracy: 0.4957
+Epoch 25/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6967 - accuracy: 0.5033 - val_loss: 0.7723 - val_accuracy: 0.4839
+Epoch 26/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6966 - accuracy: 0.5045 - val_loss: 0.7375 - val_accuracy: 0.5010
+Epoch 27/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6972 - accuracy: 0.4977 - val_loss: 0.7597 - val_accuracy: 0.4943
+Epoch 28/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6979 - accuracy: 0.4957 - val_loss: 0.7396 - val_accuracy: 0.5053
+Epoch 29/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6974 - accuracy: 0.4955 - val_loss: 0.7263 - val_accuracy: 0.5092
+Epoch 30/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6968 - accuracy: 0.4953 - val_loss: 0.7305 - val_accuracy: 0.5108
+Epoch 31/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6963 - accuracy: 0.5016 - val_loss: 0.7708 - val_accuracy: 0.4984
+Epoch 32/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6965 - accuracy: 0.5009 - val_loss: 0.7595 - val_accuracy: 0.5025
+Epoch 33/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6961 - accuracy: 0.4965 - val_loss: 0.7486 - val_accuracy: 0.5074
+Epoch 34/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6963 - accuracy: 0.4942 - val_loss: 0.7574 - val_accuracy: 0.5040
+Epoch 35/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6961 - accuracy: 0.4993 - val_loss: 0.7476 - val_accuracy: 0.4912
+Epoch 36/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6959 - accuracy: 0.4995 - val_loss: 0.7423 - val_accuracy: 0.4877
+Epoch 37/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6953 - accuracy: 0.4990 - val_loss: 0.7193 - val_accuracy: 0.5048
+Epoch 38/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6964 - accuracy: 0.4944 - val_loss: 0.7547 - val_accuracy: 0.4961
+Epoch 39/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6951 - accuracy: 0.4973 - val_loss: 0.7416 - val_accuracy: 0.4959
+Epoch 40/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6955 - accuracy: 0.4949 - val_loss: 0.7251 - val_accuracy: 0.4955
+Epoch 41/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6952 - accuracy: 0.4966 - val_loss: 0.7084 - val_accuracy: 0.4968
+Epoch 42/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6954 - accuracy: 0.4975 - val_loss: 0.7280 - val_accuracy: 0.5046
+Epoch 43/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6947 - accuracy: 0.5003 - val_loss: 0.7186 - val_accuracy: 0.5060
+Epoch 44/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6947 - accuracy: 0.4987 - val_loss: 0.7051 - val_accuracy: 0.5140
+Epoch 45/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6942 - accuracy: 0.5021 - val_loss: 0.7300 - val_accuracy: 0.4915
+Epoch 46/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6941 - accuracy: 0.5028 - val_loss: 0.7422 - val_accuracy: 0.4906
+Epoch 47/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6941 - accuracy: 0.5052 - val_loss: 0.7259 - val_accuracy: 0.5106
+Epoch 48/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6944 - accuracy: 0.5034 - val_loss: 0.7199 - val_accuracy: 0.5080
+Epoch 49/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6947 - accuracy: 0.4973 - val_loss: 0.7103 - val_accuracy: 0.4967
+Epoch 50/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6948 - accuracy: 0.4985 - val_loss: 0.7223 - val_accuracy: 0.5055
+Epoch 51/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6943 - accuracy: 0.5032 - val_loss: 0.7358 - val_accuracy: 0.4948
+Epoch 52/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6943 - accuracy: 0.4984 - val_loss: 0.7248 - val_accuracy: 0.4912
+Epoch 53/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6947 - accuracy: 0.4996 - val_loss: 0.7072 - val_accuracy: 0.5163
+Epoch 54/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6943 - accuracy: 0.4994 - val_loss: 0.7434 - val_accuracy: 0.5037
+Epoch 55/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6944 - accuracy: 0.5014 - val_loss: 0.7154 - val_accuracy: 0.4886
+Epoch 56/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6943 - accuracy: 0.4960 - val_loss: 0.7320 - val_accuracy: 0.4983
+Epoch 57/70
+617/617 [==============================] - 33s 53ms/step - loss: 0.6942 - accuracy: 0.5024 - val_loss: 0.7427 - val_accuracy: 0.5106
+Epoch 58/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6938 - accuracy: 0.5038 - val_loss: 0.7168 - val_accuracy: 0.5047
+Epoch 59/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6945 - accuracy: 0.4998 - val_loss: 0.7744 - val_accuracy: 0.4997
+Epoch 60/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6948 - accuracy: 0.4934 - val_loss: 0.7102 - val_accuracy: 0.5049
+Epoch 61/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6943 - accuracy: 0.5018 - val_loss: 0.7180 - val_accuracy: 0.5143
+Epoch 62/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6943 - accuracy: 0.4984 - val_loss: 0.7346 - val_accuracy: 0.5050
+Epoch 63/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6940 - accuracy: 0.5020 - val_loss: 0.7131 - val_accuracy: 0.5080
+Epoch 64/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6942 - accuracy: 0.5007 - val_loss: 0.7481 - val_accuracy: 0.4973
+Epoch 65/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6937 - accuracy: 0.5069 - val_loss: 0.7355 - val_accuracy: 0.5017
+Epoch 66/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6939 - accuracy: 0.4997 - val_loss: 0.7505 - val_accuracy: 0.4943
+Epoch 67/70
+617/617 [==============================] - 32s 53ms/step - loss: 0.6940 - accuracy: 0.4983 - val_loss: 0.7105 - val_accuracy: 0.4970
+Epoch 68/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6946 - accuracy: 0.4931 - val_loss: 0.7025 - val_accuracy: 0.4900
+Epoch 69/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6942 - accuracy: 0.4938 - val_loss: 0.7061 - val_accuracy: 0.4994
+Epoch 70/70
+617/617 [==============================] - 32s 52ms/step - loss: 0.6942 - accuracy: 0.4983 - val_loss: 0.7123 - val_accuracy: 0.4772
+</pre>
+---
+
+## Conclusion
+
+---
+
+
+
+```python
+plt.plot(history_34.history['loss'], 'r')
+plt.plot(history_p34.history['loss'], 'b')
+plt.title('Model training loss')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['ResNet34', 'Plain34'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+
+```python
+plt.plot(history_34.history['val_accuracy'], 'r')
+plt.plot(history_p34.history['val_accuracy'], 'b')
+plt.title('Model validation accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(['ResNet34', 'Plain34'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+
+```python
+plt.plot(history_50.history['loss'], 'r')
+plt.plot(history_p50.history['loss'], 'b')
+plt.title('Model training loss')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['ResNet50', 'Plain50'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+
+```python
+plt.plot(history_50.history['val_accuracy'], 'r')
+plt.plot(history_p50.history['val_accuracy'], 'b')
+plt.title('Model validation accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(['ResNet50', 'Plain50'], loc='upper left')
+plt.show()
+```
+
+<pre>
+<Figure size 432x288 with 1 Axes>
+</pre>
+---
+
+## Discussion
+
+---
+
+- ResNet34가 ResNet50보다 빠른 속도로 학습이 되는 것을 확인할 수 있다. 
+
+- Early stopping의 결과로 ResNet34는 epoch=26에서, ResNet50은 epoch=70에서 최적의 학습효율을 보였고 Plain 모델들도 이에 맞춰 설계했다.
+
+- 모든 ResNet 모델이 loss 수렴이나 정확도 증가에서 Plain 모델보다 더욱 좋은 성능을 보였기에 ResNet의 실효성은 입증된다고 볼 수 있다.
+
+- 그러나 ResNet의 validation accuracy가 크게 높지 않음(0.5~0.6)은 모델 설계과정에서 문제가 있음을 시사한다.
+
