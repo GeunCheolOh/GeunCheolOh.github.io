@@ -1,5 +1,5 @@
 ---
-layout: single
+layout: post
 title:  "ResNet34 & 50 구현하기"
 categories: implementation
 tag: [ResNet, implementation]
