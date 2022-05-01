@@ -30,8 +30,15 @@ google-analytics: # Add your identifier. For example UA-99631805-1
 # Comment Section (Disqus)
 disqus-identifier: GeunCheolOh # Add your shortname for Disqus Comment. For example mr-brown
 
-# Build settings
+# Conversion 수식 입력용 코드
 markdown: kramdown
+highlighter: rouge
+lsi: false
+excerpt_separator: "\n\n"
+incremental: false
+
+# Build settings
+#markdown: kramdown
 permalink: /:year/:month/:day/:title/
 plugins:
   - jekyll-paginate
